@@ -218,86 +218,60 @@ class KernelBuilder:
             valu_slots = [("+", addr_scratch[u+i], v_forest_p, v_idx[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
-        # --- Block Interleaved Scheduler ---
-        
-        def get_compute_ops(u_start):
-            ops = []
-            us = [u_start, u_start + 1]
-            
-            # XOR
-            for u in us:
-                ops.append(("^", v_val[u], v_val[u], v_node[u]))
-            
-            # Hash
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                vc1, vc3, _, _ = v_hash_consts[hi]
-                for u in us:
-                    ops.append((op1, v_tmp1[u], v_val[u], vc1))
-                    ops.append((op3, v_tmp2[u], v_val[u], vc3))
-                    ops.append((op2, v_val[u], v_tmp1[u], v_tmp2[u]))
-            
-            # Idx update
-            for u in us:
-                ops.append(("&", v_tmp1[u], v_val[u], v_one))
-                ops.append(("*", v_idx[u], v_idx[u], v_two))
-                ops.append(("+", v_tmp1[u], v_tmp1[u], v_one))
-                ops.append(("+", v_idx[u], v_idx[u], v_tmp1[u]))
-            
-            # Mask
-            for u in us:
-                ops.append(("<", v_tmp1[u], v_idx[u], v_n_nodes))
-                ops.append(("-", v_tmp1[u], v_zero, v_tmp1[u]))
-                ops.append(("&", v_idx[u], v_idx[u], v_tmp1[u]))
-            
-            return ops
+        # Scatter loads
+        for i in range(VLEN):
+            for u in range(0, UNROLL, 2):
+                loads = [("load_offset", v_node[u], addr_scratch[u], i)]
+                if u + 1 < UNROLL:
+                    loads.append(("load_offset", v_node[u+1], addr_scratch[u+1], i))
+                self.emit({"load": loads})
 
-        compute_queue = []
+        # XOR
+        for u in range(0, UNROLL, 6):
+            valu_slots = [("^", v_val[u+i], v_val[u+i], v_node[u+i]) for i in range(min(6, UNROLL - u))]
+            self.emit({"valu": valu_slots})
+
+        # Hash
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            vc1, vc3, _, _ = v_hash_consts[hi]
+            for u in range(0, UNROLL, 3):
+                valu_slots = []
+                for i in range(min(3, UNROLL - u)):
+                    valu_slots.append((op1, v_tmp1[u+i], v_val[u+i], vc1))
+                    valu_slots.append((op3, v_tmp2[u+i], v_val[u+i], vc3))
+                self.emit({"valu": valu_slots})
+            for u in range(0, UNROLL, 6):
+                valu_slots = [(op2, v_val[u+i], v_tmp1[u+i], v_tmp2[u+i]) for i in range(min(6, UNROLL - u))]
+                self.emit({"valu": valu_slots})
+
+        # idx = 2*idx + (1 + (val & 1))
+        for u in range(0, UNROLL, 3):
+            valu_slots = []
+            for i in range(min(3, UNROLL - u)):
+                valu_slots.append(("&", v_tmp1[u+i], v_val[u+i], v_one))
+                valu_slots.append(("*", v_idx[u+i], v_idx[u+i], v_two))
+            self.emit({"valu": valu_slots})
         
-        # We process in 8 blocks (pairs of vectors)
-        # Step k (0..8): Load Block k (if k<8), Compute Block k-1 (if k>0)
+        for u in range(0, UNROLL, 6):
+            valu_slots = [("+", v_tmp1[u+i], v_tmp1[u+i], v_one) for i in range(min(6, UNROLL - u))]
+            self.emit({"valu": valu_slots})
         
-        for step in range(9):
-            # 1. Generate new work
-            load_ops_for_step = []
-            
-            if step < 8:
-                u_start = step * 2
-                # Generate 8 bundles of loads (offset 0..7)
-                for i in range(VLEN):
-                    bundle = []
-                    bundle.append(("load_offset", v_node[u_start], addr_scratch[u_start], i))
-                    bundle.append(("load_offset", v_node[u_start+1], addr_scratch[u_start+1], i))
-                    load_ops_for_step.append(bundle)
-            
-            if step > 0:
-                u_prev = (step - 1) * 2
-                compute_queue.extend(get_compute_ops(u_prev))
-            
-            # 2. Emit bundles
-            # While we have loads to emit, pair them with compute
-            for load_bundle in load_ops_for_step:
-                instr = {"load": load_bundle}
-                
-                # Fill with up to 6 compute ops
-                take = min(6, len(compute_queue))
-                if take > 0:
-                    instr["valu"] = compute_queue[:take]
-                    compute_queue = compute_queue[take:]
-                
-                self.emit(instr)
-            
-            # If no loads were generated (step 8), or if we still have excess compute?
-            # Actually, we should just let the compute queue accumulate/drain in the next steps?
-            # But in step 8, there are no loads, so we must drain the queue explicitly 
-            # or rely on the loop structure. 
-            # Since 'load_ops_for_step' is empty in step 8, the loop above won't run.
-            # So we need a drain loop.
-            
-        # Drain remaining compute
-        while compute_queue:
-            take = min(6, len(compute_queue))
-            self.emit({"valu": compute_queue[:take]})
-            compute_queue = compute_queue[take:]
+        for u in range(0, UNROLL, 6):
+            valu_slots = [("+", v_idx[u+i], v_idx[u+i], v_tmp1[u+i]) for i in range(min(6, UNROLL - u))]
+            self.emit({"valu": valu_slots})
+
+        # idx = idx & mask where mask = -(idx < n_nodes)
+        for u in range(0, UNROLL, 6):
+            valu_slots = [("<", v_tmp1[u+i], v_idx[u+i], v_n_nodes) for i in range(min(6, UNROLL - u))]
+            self.emit({"valu": valu_slots})
+        
+        for u in range(0, UNROLL, 6):
+            valu_slots = [("-", v_tmp1[u+i], v_zero, v_tmp1[u+i]) for i in range(min(6, UNROLL - u))]
+            self.emit({"valu": valu_slots})
+        
+        for u in range(0, UNROLL, 6):
+            valu_slots = [("&", v_idx[u+i], v_idx[u+i], v_tmp1[u+i]) for i in range(min(6, UNROLL - u))]
+            self.emit({"valu": valu_slots})
 
         # Store with loop control overlapped
         for u in range(UNROLL - 1):
