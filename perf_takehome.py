@@ -114,35 +114,43 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Use multiply_add instruction to fuse idx = 2*idx + (1 + (val & 1))
-        This reduces 3 VALU cycles to 2 VALU cycles per unroll group!
+        Heavily micro-optimized UNROLL=16.
+        Every cycle counts - minimize initialization, maximize packing.
         """
         UNROLL = 16
         
         tmp1 = self.alloc_scratch("tmp1")
         
-        init_vars = [
-            "rounds", "n_nodes", "batch_size", "forest_height",
-            "forest_values_p", "inp_indices_p", "inp_values_p",
-        ]
-        for v in init_vars:
+        # Minimal initialization
+        for v in ["rounds", "n_nodes", "batch_size", "forest_height",
+                "forest_values_p", "inp_indices_p", "inp_values_p"]:
             self.alloc_scratch(v, 1)
         
-        addr_tmps = [self.alloc_scratch(f"addr_tmp_{i}") for i in range(len(init_vars))]
-        for i, v in enumerate(init_vars):
-            self.emit({"load": [("const", addr_tmps[i], i)]})
-        for i in range(0, len(init_vars), 2):
-            loads = [("load", self.scratch[init_vars[i]], addr_tmps[i])]
-            if i + 1 < len(init_vars):
-                loads.append(("load", self.scratch[init_vars[i+1]], addr_tmps[i+1]))
+        # Load config efficiently - batch by 2
+        for i in range(0, 7, 2):
+            addr1 = self.alloc_scratch(f"_at{i}")
+            addr2 = self.alloc_scratch(f"_at{i+1}") if i+1 < 7 else None
+            if addr2:
+                self.emit({"load": [("const", addr1, i), ("const", addr2, i+1)]})
+            else:
+                self.emit({"load": [("const", addr1, i)]})
+        
+        # Load values
+        vars = ["rounds", "n_nodes", "batch_size", "forest_height",
+                "forest_values_p", "inp_indices_p", "inp_values_p"]
+        for i in range(0, 7, 2):
+            loads = [("load", self.scratch[vars[i]], self.scratch[f"_at{i}"])]
+            if i+1 < 7:
+                loads.append(("load", self.scratch[vars[i+1]], self.scratch[f"_at{i+1}"]))
             self.emit({"load": loads})
 
+        # Constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
-
         self.emit_const_inits()
 
+        # Broadcast constants
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
@@ -157,6 +165,7 @@ class KernelBuilder:
             ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]),
         ]})
 
+        # Hash constants
         v_hash_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1 = self.scratch_const(val1)
@@ -168,15 +177,14 @@ class KernelBuilder:
         self.emit_const_inits()
         for i in range(0, len(v_hash_consts), 3):
             valu_slots = []
-            for j in range(3):
-                if i + j < len(v_hash_consts):
-                    vc1, vc3, c1, c3 = v_hash_consts[i + j]
-                    valu_slots.append(("vbroadcast", vc1, c1))
-                    valu_slots.append(("vbroadcast", vc3, c3))
+            for j in range(min(3, len(v_hash_consts) - i)):
+                vc1, vc3, c1, c3 = v_hash_consts[i + j]
+                valu_slots.extend([("vbroadcast", vc1, c1), ("vbroadcast", vc3, c3)])
             self.emit({"valu": valu_slots})
 
         self.emit({"flow": [("pause",)]})
 
+        # Working registers
         v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
         v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
         v_node = [self.alloc_scratch(f"v_node_{u}", VLEN) for u in range(UNROLL)]
@@ -194,19 +202,15 @@ class KernelBuilder:
 
         self.emit_const_inits()
 
+        # Offset constants
         v_offset_consts = self.alloc_scratch("v_offset_consts", 16)
-        v_offsets_0 = v_offset_consts
-        v_offsets_8 = v_offset_consts + 8
-        
-        load_slots = []
-        for i in range(16):
-            load_slots.append(("const", v_offset_consts + i, i * VLEN))
-            if len(load_slots) == 2:
-                self.emit({"load": load_slots})
-                load_slots = []
-        if load_slots:
-            self.emit({"load": load_slots})
+        for i in range(0, 16, 2):
+            self.emit({"load": [
+                ("const", v_offset_consts + i, i * VLEN),
+                ("const", v_offset_consts + i + 1, (i + 1) * VLEN)
+            ]})
 
+        # Init loop
         self.emit({"alu": [
             ("+", idx_base[0], self.scratch["inp_indices_p"], zero_const),
             ("+", val_base[0], self.scratch["inp_values_p"], zero_const),
@@ -215,6 +219,7 @@ class KernelBuilder:
 
         loop_start = len(self.instrs)
 
+        # Base addresses - optimized
         v_tmp_base_idx = self.alloc_scratch("v_tmp_base_idx", VLEN)
         v_tmp_base_val = self.alloc_scratch("v_tmp_base_val", VLEN)
         self.emit({"valu": [
@@ -223,19 +228,22 @@ class KernelBuilder:
         ]})
         
         self.emit({"valu": [
-            ("+", idx_base[0], v_tmp_base_idx, v_offsets_0),
-            ("+", val_base[0], v_tmp_base_val, v_offsets_0),
-            ("+", idx_base[8], v_tmp_base_idx, v_offsets_8),
-            ("+", val_base[8], v_tmp_base_val, v_offsets_8),
+            ("+", idx_base[0], v_tmp_base_idx, v_offset_consts),
+            ("+", val_base[0], v_tmp_base_val, v_offset_consts),
+            ("+", idx_base[8], v_tmp_base_idx, v_offset_consts + 8),
+            ("+", val_base[8], v_tmp_base_val, v_offset_consts + 8),
         ]})
 
+        # Loads
         for u in range(UNROLL):
             self.emit({"load": [("vload", v_idx[u], idx_base[u]), ("vload", v_val[u], val_base[u])]})
 
+        # Scatter addresses
         for u in range(0, UNROLL, 6):
             valu_slots = [("+", addr_scratch[u+i], v_forest_p, v_idx[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
+        # Scatter loads
         for i in range(VLEN):
             for u in range(0, UNROLL, 2):
                 loads = [("load_offset", v_node[u], addr_scratch[u], i)]
@@ -243,50 +251,37 @@ class KernelBuilder:
                     loads.append(("load_offset", v_node[u+1], addr_scratch[u+1], i))
                 self.emit({"load": loads})
 
+        # XOR
         for u in range(0, UNROLL, 6):
             valu_slots = [("^", v_val[u+i], v_val[u+i], v_node[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+        # Hash
+        for hi, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
             vc1, vc3, _, _ = v_hash_consts[hi]
             for u in range(0, UNROLL, 3):
                 valu_slots = []
                 for i in range(min(3, UNROLL - u)):
-                    valu_slots.append((op1, v_tmp1[u+i], v_val[u+i], vc1))
-                    valu_slots.append((op3, v_tmp2[u+i], v_val[u+i], vc3))
+                    valu_slots.extend([(op1, v_tmp1[u+i], v_val[u+i], vc1), (op3, v_tmp2[u+i], v_val[u+i], vc3)])
                 self.emit({"valu": valu_slots})
             for u in range(0, UNROLL, 6):
                 valu_slots = [(op2, v_val[u+i], v_tmp1[u+i], v_tmp2[u+i]) for i in range(min(6, UNROLL - u))]
                 self.emit({"valu": valu_slots})
 
-        # ===== KEY OPTIMIZATION: Use multiply_add for idx = 2*idx + (1 + (val & 1)) =====
-        # Instead of:
-        #   tmp1 = val & 1
-        #   idx = idx * 2  
-        #   tmp1 = tmp1 + 1
-        #   idx = idx + tmp1
-        # Do:
-        #   tmp1 = val & 1
-        #   tmp1 = tmp1 + 1
-        #   idx = multiply_add(idx, 2, tmp1)  // idx*2 + tmp1
-        
-        # Stage 1: tmp1 = (val & 1) + 1
+        # Index update with multiply_add
         for u in range(0, UNROLL, 6):
-            valu_slots = []
-            for i in range(min(6, UNROLL - u)):
-                valu_slots.append(("&", v_tmp1[u+i], v_val[u+i], v_one))
+            valu_slots = [("&", v_tmp1[u+i], v_val[u+i], v_one) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
         
         for u in range(0, UNROLL, 6):
             valu_slots = [("+", v_tmp1[u+i], v_tmp1[u+i], v_one) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
         
-        # Stage 2: idx = idx*2 + tmp1 using multiply_add (ONE cycle instead of TWO!)
         for u in range(0, UNROLL, 6):
             valu_slots = [("multiply_add", v_idx[u+i], v_idx[u+i], v_two, v_tmp1[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
-        # Masking (unchanged)
+        # Masking
         for u in range(0, UNROLL, 6):
             valu_slots = [("<", v_tmp1[u+i], v_idx[u+i], v_n_nodes) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
@@ -299,6 +294,7 @@ class KernelBuilder:
             valu_slots = [("&", v_idx[u+i], v_idx[u+i], v_tmp1[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
+        # Stores - minimal
         for u in range(UNROLL - 1):
             self.emit({"store": [("vstore", idx_base[u], v_idx[u]), ("vstore", val_base[u], v_val[u])]})
         
