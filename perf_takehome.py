@@ -85,93 +85,239 @@ class KernelBuilder:
 
         return slots
 
+    def emit(self, instr):
+        """Add a packed instruction bundle"""
+        self.instrs.append(instr)
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Vectorized + packed VLIW + unrolled with bitwise ops.
+        Overlap scalar ALU (12 slots) with valu (6 slots) operations.
         """
+        UNROLL = 16
+        
         tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+        
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
+        
+        addr_tmps = [self.alloc_scratch(f"addr_tmp_{i}") for i in range(len(init_vars))]
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.emit({"load": [("const", addr_tmps[i], i)]})
+        for i in range(0, len(init_vars), 2):
+            loads = [("load", self.scratch[init_vars[i]], addr_tmps[i])]
+            if i + 1 < len(init_vars):
+                loads.append(("load", self.scratch[init_vars[i+1]], addr_tmps[i+1]))
+            self.emit({"load": loads})
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+        
+        self.emit({"valu": [
+            ("vbroadcast", v_zero, zero_const),
+            ("vbroadcast", v_one, one_const),
+            ("vbroadcast", v_two, two_const),
+            ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+            ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]),
+        ]})
 
-        body = []  # array of slots
+        v_hash_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1 = self.scratch_const(val1)
+            c3 = self.scratch_const(val3)
+            vc1 = self.alloc_scratch(f"v_hc1_{hi}", VLEN)
+            vc3 = self.alloc_scratch(f"v_hc3_{hi}", VLEN)
+            v_hash_consts.append((vc1, vc3, c1, c3))
+        
+        for i in range(0, len(v_hash_consts), 3):
+            valu_slots = []
+            for j in range(3):
+                if i + j < len(v_hash_consts):
+                    vc1, vc3, c1, c3 = v_hash_consts[i + j]
+                    valu_slots.append(("vbroadcast", vc1, c1))
+                    valu_slots.append(("vbroadcast", vc3, c3))
+            self.emit({"valu": valu_slots})
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        self.emit({"flow": [("pause",)]})
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
+        v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
+        v_node = [self.alloc_scratch(f"v_node_{u}", VLEN) for u in range(UNROLL)]
+        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{u}", VLEN) for u in range(UNROLL)]
+        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{u}", VLEN) for u in range(UNROLL)]
+        addr_scratch = [self.alloc_scratch(f"addr_{u}", VLEN) for u in range(UNROLL)]
+        idx_base = [self.alloc_scratch(f"idx_base_{u}") for u in range(UNROLL)]
+        val_base = [self.alloc_scratch(f"val_base_{u}") for u in range(UNROLL)]
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        loop_counter = self.alloc_scratch("loop_counter")
+        batch_offset = self.alloc_scratch("batch_offset")
+        batch_size_const = self.scratch_const(batch_size)
+        total_iters = self.scratch_const(rounds * (batch_size // VLEN) // UNROLL)
+        stride_const = self.scratch_const(VLEN * UNROLL)
+
+        # Create vector offsets for base calculation
+        v_offset_consts = self.alloc_scratch("v_offset_consts", 16)
+        v_offsets_0 = v_offset_consts
+        v_offsets_8 = v_offset_consts + 8
+        
+        # Initialize offset constants
+        load_slots = []
+        for i in range(16):
+            load_slots.append(("const", v_offset_consts + i, i * VLEN))
+            if len(load_slots) == 2:
+                self.emit({"load": load_slots})
+                load_slots = []
+        if load_slots:
+            self.emit({"load": load_slots})
+
+        # Initialize running pointers and loop counter
+        self.emit({"alu": [
+            ("+", idx_base[0], self.scratch["inp_indices_p"], zero_const),
+            ("+", val_base[0], self.scratch["inp_values_p"], zero_const),
+        ]})
+        self.emit({"load": [("const", loop_counter, 0), ("const", batch_offset, 0)]})
+
+        loop_start = len(self.instrs)
+
+        # Calculate base addresses: idx_base[0..15] = idx_base[0] + offsets (2 cycles using VALU)
+        # Cycle 1: Broadcast base[0]
+        v_tmp_base_idx = self.alloc_scratch("v_tmp_base_idx", VLEN)
+        v_tmp_base_val = self.alloc_scratch("v_tmp_base_val", VLEN)
+        self.emit({"valu": [
+            ("vbroadcast", v_tmp_base_idx, idx_base[0]),
+            ("vbroadcast", v_tmp_base_val, val_base[0]),
+        ]})
+        
+        # Cycle 2: Add offsets
+        self.emit({"valu": [
+            ("+", idx_base[0], v_tmp_base_idx, v_offsets_0),
+            ("+", val_base[0], v_tmp_base_val, v_offsets_0),
+            ("+", idx_base[8], v_tmp_base_idx, v_offsets_8),
+            ("+", val_base[8], v_tmp_base_val, v_offsets_8),
+        ]})
+
+        # Load indices/values
+        for u in range(UNROLL):
+            self.emit({"load": [("vload", v_idx[u], idx_base[u]), ("vload", v_val[u], val_base[u])]})
+
+        # Compute scatter addresses
+        for u in range(0, UNROLL, 6):
+            valu_slots = [("+", addr_scratch[u+i], v_forest_p, v_idx[u+i]) for i in range(min(6, UNROLL - u))]
+            self.emit({"valu": valu_slots})
+
+        # --- Block Interleaved Scheduler ---
+        
+        def get_compute_ops(u_start):
+            ops = []
+            us = [u_start, u_start + 1]
+            
+            # XOR
+            for u in us:
+                ops.append(("^", v_val[u], v_val[u], v_node[u]))
+            
+            # Hash
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                vc1, vc3, _, _ = v_hash_consts[hi]
+                for u in us:
+                    ops.append((op1, v_tmp1[u], v_val[u], vc1))
+                    ops.append((op3, v_tmp2[u], v_val[u], vc3))
+                    ops.append((op2, v_val[u], v_tmp1[u], v_tmp2[u]))
+            
+            # Idx update
+            for u in us:
+                ops.append(("&", v_tmp1[u], v_val[u], v_one))
+                ops.append(("*", v_idx[u], v_idx[u], v_two))
+                ops.append(("+", v_tmp1[u], v_tmp1[u], v_one))
+                ops.append(("+", v_idx[u], v_idx[u], v_tmp1[u]))
+            
+            # Mask
+            for u in us:
+                ops.append(("<", v_tmp1[u], v_idx[u], v_n_nodes))
+                ops.append(("-", v_tmp1[u], v_zero, v_tmp1[u]))
+                ops.append(("&", v_idx[u], v_idx[u], v_tmp1[u]))
+            
+            return ops
+
+        compute_queue = []
+        
+        # We process in 8 blocks (pairs of vectors)
+        # Step k (0..8): Load Block k (if k<8), Compute Block k-1 (if k>0)
+        
+        for step in range(9):
+            # 1. Generate new work
+            load_ops_for_step = []
+            
+            if step < 8:
+                u_start = step * 2
+                # Generate 8 bundles of loads (offset 0..7)
+                for i in range(VLEN):
+                    bundle = []
+                    bundle.append(("load_offset", v_node[u_start], addr_scratch[u_start], i))
+                    bundle.append(("load_offset", v_node[u_start+1], addr_scratch[u_start+1], i))
+                    load_ops_for_step.append(bundle)
+            
+            if step > 0:
+                u_prev = (step - 1) * 2
+                compute_queue.extend(get_compute_ops(u_prev))
+            
+            # 2. Emit bundles
+            # While we have loads to emit, pair them with compute
+            for load_bundle in load_ops_for_step:
+                instr = {"load": load_bundle}
+                
+                # Fill with up to 6 compute ops
+                take = min(6, len(compute_queue))
+                if take > 0:
+                    instr["valu"] = compute_queue[:take]
+                    compute_queue = compute_queue[take:]
+                
+                self.emit(instr)
+            
+            # If no loads were generated (step 8), or if we still have excess compute?
+            # Actually, we should just let the compute queue accumulate/drain in the next steps?
+            # But in step 8, there are no loads, so we must drain the queue explicitly 
+            # or rely on the loop structure. 
+            # Since 'load_ops_for_step' is empty in step 8, the loop above won't run.
+            # So we need a drain loop.
+            
+        # Drain remaining compute
+        while compute_queue:
+            take = min(6, len(compute_queue))
+            self.emit({"valu": compute_queue[:take]})
+            compute_queue = compute_queue[take:]
+
+        # Store with loop control overlapped
+        for u in range(UNROLL - 1):
+            self.emit({"store": [("vstore", idx_base[u], v_idx[u]), ("vstore", val_base[u], v_val[u])]})
+        
+        # Last store with loop control
+        self.emit({
+            "store": [("vstore", idx_base[UNROLL-1], v_idx[UNROLL-1]), ("vstore", val_base[UNROLL-1], v_val[UNROLL-1])],
+            "alu": [("+", batch_offset, batch_offset, stride_const), ("+", loop_counter, loop_counter, one_const)],
+        })
+        
+        self.emit({"alu": [("%", batch_offset, batch_offset, batch_size_const), ("<", tmp1, loop_counter, total_iters)]})
+        self.emit({
+            "flow": [("cond_jump", tmp1, loop_start)],
+            "alu": [
+                ("+", idx_base[0], self.scratch["inp_indices_p"], batch_offset),
+                ("+", val_base[0], self.scratch["inp_values_p"], batch_offset)
+            ]
+        })
+        self.emit({"flow": [("pause",)]})
 
 BASELINE = 147734
 
