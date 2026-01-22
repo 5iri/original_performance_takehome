@@ -114,11 +114,10 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Software pipelined kernel - overlap operations from different stages.
-        Key optimization: While doing scatter loads for iteration N, 
-        do computation (hash/stores) for iteration N-1.
+        Use multiply_add instruction to fuse idx = 2*idx + (1 + (val & 1))
+        This reduces 3 VALU cycles to 2 VALU cycles per unroll group!
         """
-        UNROLL = 16 # Max Unroll factor possible
+        UNROLL = 16
         
         tmp1 = self.alloc_scratch("tmp1")
         
@@ -129,39 +128,19 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
         
-        # Optimized initialization - batch constant loads
-        addr_tmps = [self.alloc_scratch(f"addr_tmp_{i}") for i in range(4)]
-        
-        # Load first 4 config addresses
-        self.emit({"load": [("const", addr_tmps[0], 0), ("const", addr_tmps[1], 1)]})
-        self.emit({"load": [("const", addr_tmps[2], 2), ("const", addr_tmps[3], 3)]})
-        
-        # Load config values
-        self.emit({"load": [
-            ("load", self.scratch["rounds"], addr_tmps[0]),
-            ("load", self.scratch["n_nodes"], addr_tmps[1])
-        ]})
-        self.emit({"load": [
-            ("load", self.scratch["batch_size"], addr_tmps[2]),
-            ("load", self.scratch["forest_height"], addr_tmps[3])
-        ]})
-        
-        # Load pointer addresses
-        self.emit({"load": [("const", addr_tmps[0], 4), ("const", addr_tmps[1], 5)]})
-        self.emit({"load": [("const", addr_tmps[2], 6)]})
-        
-        # Load pointers
-        self.emit({"load": [
-            ("load", self.scratch["forest_values_p"], addr_tmps[0]),
-            ("load", self.scratch["inp_indices_p"], addr_tmps[1])
-        ]})
-        self.emit({"load": [("load", self.scratch["inp_values_p"], addr_tmps[2])]})
+        addr_tmps = [self.alloc_scratch(f"addr_tmp_{i}") for i in range(len(init_vars))]
+        for i, v in enumerate(init_vars):
+            self.emit({"load": [("const", addr_tmps[i], i)]})
+        for i in range(0, len(init_vars), 2):
+            loads = [("load", self.scratch[init_vars[i]], addr_tmps[i])]
+            if i + 1 < len(init_vars):
+                loads.append(("load", self.scratch[init_vars[i+1]], addr_tmps[i+1]))
+            self.emit({"load": loads})
 
-        # Batch allocate constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
-        
+
         self.emit_const_inits()
 
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -170,7 +149,6 @@ class KernelBuilder:
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         
-        # Broadcast in one shot
         self.emit({"valu": [
             ("vbroadcast", v_zero, zero_const),
             ("vbroadcast", v_one, one_const),
@@ -179,7 +157,6 @@ class KernelBuilder:
             ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]),
         ]})
 
-        # Pre-compute hash constants
         v_hash_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1 = self.scratch_const(val1)
@@ -200,7 +177,6 @@ class KernelBuilder:
 
         self.emit({"flow": [("pause",)]})
 
-        # Allocate working registers
         v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
         v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
         v_node = [self.alloc_scratch(f"v_node_{u}", VLEN) for u in range(UNROLL)]
@@ -222,14 +198,15 @@ class KernelBuilder:
         v_offsets_0 = v_offset_consts
         v_offsets_8 = v_offset_consts + 8
         
-        # Batch load offset constants
-        for i in range(0, 16, 2):
-            self.emit({"load": [
-                ("const", v_offset_consts + i, i * VLEN),
-                ("const", v_offset_consts + i + 1, (i + 1) * VLEN)
-            ]})
+        load_slots = []
+        for i in range(16):
+            load_slots.append(("const", v_offset_consts + i, i * VLEN))
+            if len(load_slots) == 2:
+                self.emit({"load": load_slots})
+                load_slots = []
+        if load_slots:
+            self.emit({"load": load_slots})
 
-        # Initialize loop
         self.emit({"alu": [
             ("+", idx_base[0], self.scratch["inp_indices_p"], zero_const),
             ("+", val_base[0], self.scratch["inp_values_p"], zero_const),
@@ -238,7 +215,6 @@ class KernelBuilder:
 
         loop_start = len(self.instrs)
 
-        # Calculate base addresses (kept from original - it's fine)
         v_tmp_base_idx = self.alloc_scratch("v_tmp_base_idx", VLEN)
         v_tmp_base_val = self.alloc_scratch("v_tmp_base_val", VLEN)
         self.emit({"valu": [
@@ -253,16 +229,13 @@ class KernelBuilder:
             ("+", val_base[8], v_tmp_base_val, v_offsets_8),
         ]})
 
-        # Load indices/values
         for u in range(UNROLL):
             self.emit({"load": [("vload", v_idx[u], idx_base[u]), ("vload", v_val[u], val_base[u])]})
 
-        # Compute scatter addresses - fill all 6 VALU slots
         for u in range(0, UNROLL, 6):
             valu_slots = [("+", addr_scratch[u+i], v_forest_p, v_idx[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
-        # Scatter loads - still the bottleneck, but we'll optimize after
         for i in range(VLEN):
             for u in range(0, UNROLL, 2):
                 loads = [("load_offset", v_node[u], addr_scratch[u], i)]
@@ -270,12 +243,10 @@ class KernelBuilder:
                     loads.append(("load_offset", v_node[u+1], addr_scratch[u+1], i))
                 self.emit({"load": loads})
 
-        # XOR - fill all 6 VALU slots
         for u in range(0, UNROLL, 6):
             valu_slots = [("^", v_val[u+i], v_val[u+i], v_node[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
-        # Hash - already optimized to use all 6 VALU slots
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             vc1, vc3, _, _ = v_hash_consts[hi]
             for u in range(0, UNROLL, 3):
@@ -288,24 +259,34 @@ class KernelBuilder:
                 valu_slots = [(op2, v_val[u+i], v_tmp1[u+i], v_tmp2[u+i]) for i in range(min(6, UNROLL - u))]
                 self.emit({"valu": valu_slots})
 
-        # Index update - combine operations where possible
-        # Instead of separate loops, combine mask & multiply in same cycle
-        for u in range(0, UNROLL, 3):
+        # ===== KEY OPTIMIZATION: Use multiply_add for idx = 2*idx + (1 + (val & 1)) =====
+        # Instead of:
+        #   tmp1 = val & 1
+        #   idx = idx * 2  
+        #   tmp1 = tmp1 + 1
+        #   idx = idx + tmp1
+        # Do:
+        #   tmp1 = val & 1
+        #   tmp1 = tmp1 + 1
+        #   idx = multiply_add(idx, 2, tmp1)  // idx*2 + tmp1
+        
+        # Stage 1: tmp1 = (val & 1) + 1
+        for u in range(0, UNROLL, 6):
             valu_slots = []
-            for i in range(min(3, UNROLL - u)):
+            for i in range(min(6, UNROLL - u)):
                 valu_slots.append(("&", v_tmp1[u+i], v_val[u+i], v_one))
-                valu_slots.append(("*", v_idx[u+i], v_idx[u+i], v_two))
             self.emit({"valu": valu_slots})
         
         for u in range(0, UNROLL, 6):
             valu_slots = [("+", v_tmp1[u+i], v_tmp1[u+i], v_one) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
         
+        # Stage 2: idx = idx*2 + tmp1 using multiply_add (ONE cycle instead of TWO!)
         for u in range(0, UNROLL, 6):
-            valu_slots = [("+", v_idx[u+i], v_idx[u+i], v_tmp1[u+i]) for i in range(min(6, UNROLL - u))]
+            valu_slots = [("multiply_add", v_idx[u+i], v_idx[u+i], v_two, v_tmp1[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
-        # Mask application
+        # Masking (unchanged)
         for u in range(0, UNROLL, 6):
             valu_slots = [("<", v_tmp1[u+i], v_idx[u+i], v_n_nodes) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
@@ -318,50 +299,22 @@ class KernelBuilder:
             valu_slots = [("&", v_idx[u+i], v_idx[u+i], v_tmp1[u+i]) for i in range(min(6, UNROLL - u))]
             self.emit({"valu": valu_slots})
 
-        # ===== KEY OPTIMIZATION: Overlap stores with loop control and ALU work =====
-        # Use all available ALU slots during stores
-        
-        # First batch of stores - start loop control
-        for u in range(0, 6):
-            if u == 0:
-                self.emit({
-                    "store": [("vstore", idx_base[u], v_idx[u]), ("vstore", val_base[u], v_val[u])],
-                    "alu": [
-                        ("+", batch_offset, batch_offset, stride_const),
-                        ("+", loop_counter, loop_counter, one_const),
-                    ]
-                })
-            else:
-                self.emit({"store": [("vstore", idx_base[u], v_idx[u]), ("vstore", val_base[u], v_val[u])]})
-        
-        # Continue stores with modulo calculation
-        self.emit({
-            "store": [("vstore", idx_base[6], v_idx[6]), ("vstore", val_base[6], v_val[6])],
-            "alu": [("%", batch_offset, batch_offset, batch_size_const)]
-        })
-        
-        # More stores
-        for u in range(7, 14):
+        for u in range(UNROLL - 1):
             self.emit({"store": [("vstore", idx_base[u], v_idx[u]), ("vstore", val_base[u], v_val[u])]})
         
-        # Store with loop comparison
         self.emit({
-            "store": [("vstore", idx_base[14], v_idx[14]), ("vstore", val_base[14], v_val[14])],
-            "alu": [("<", tmp1, loop_counter, total_iters)]
+            "store": [("vstore", idx_base[UNROLL-1], v_idx[UNROLL-1]), ("vstore", val_base[UNROLL-1], v_val[UNROLL-1])],
+            "alu": [("+", batch_offset, batch_offset, stride_const), ("+", loop_counter, loop_counter, one_const)],
         })
         
-        # Last store with jump preparation
+        self.emit({"alu": [("%", batch_offset, batch_offset, batch_size_const), ("<", tmp1, loop_counter, total_iters)]})
         self.emit({
-            "store": [("vstore", idx_base[15], v_idx[15]), ("vstore", val_base[15], v_val[15])],
+            "flow": [("cond_jump", tmp1, loop_start)],
             "alu": [
                 ("+", idx_base[0], self.scratch["inp_indices_p"], batch_offset),
                 ("+", val_base[0], self.scratch["inp_values_p"], batch_offset)
             ]
         })
-        
-        # Jump
-        self.emit({"flow": [("cond_jump", tmp1, loop_start)]})
-        
         self.emit({"flow": [("pause",)]})
 BASELINE = 147734
 
