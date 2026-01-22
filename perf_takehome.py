@@ -44,6 +44,7 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self._const_pending = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -70,9 +71,29 @@ class KernelBuilder:
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            # Record constant to be emitted later in grouped loads
             self.const_map[val] = addr
+            self._const_pending.append((addr, val))
         return self.const_map[val]
+
+    def emit_const_inits(self):
+        """Emit pending constant loads in grouped load slots (2 per cycle).
+
+        Call this before any instructions that depend on the constant
+        scratch addresses (e.g., `vbroadcast`). Grouping reduces number of
+        load instructions produced by `scratch_const` calls.
+        """
+        if not self._const_pending:
+            return
+        load_slots = []
+        for addr, val in self._const_pending:
+            load_slots.append(("const", addr, val))
+            if len(load_slots) == 2:
+                self.emit({"load": load_slots})
+                load_slots = []
+        if load_slots:
+            self.emit({"load": load_slots})
+        self._const_pending = []
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
@@ -120,6 +141,9 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
+        # Emit pending constant loads before using them in vbroadcast
+        self.emit_const_inits()
+
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
@@ -141,7 +165,8 @@ class KernelBuilder:
             vc1 = self.alloc_scratch(f"v_hc1_{hi}", VLEN)
             vc3 = self.alloc_scratch(f"v_hc3_{hi}", VLEN)
             v_hash_consts.append((vc1, vc3, c1, c3))
-        
+        # Emit hash-related constants before broadcasting them
+        self.emit_const_inits()
         for i in range(0, len(v_hash_consts), 3):
             valu_slots = []
             for j in range(3):
@@ -167,6 +192,9 @@ class KernelBuilder:
         batch_size_const = self.scratch_const(batch_size)
         total_iters = self.scratch_const(rounds * (batch_size // VLEN) // UNROLL)
         stride_const = self.scratch_const(VLEN * UNROLL)
+
+        # Emit loop-related constants so subsequent ALU/flow ops read valid values
+        self.emit_const_inits()
 
         # Create vector offsets for base calculation
         v_offset_consts = self.alloc_scratch("v_offset_consts", 16)
