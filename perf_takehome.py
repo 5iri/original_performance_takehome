@@ -75,7 +75,7 @@ class Scheduler:
             # We iterate multiple times to fill holes? No, just once per cycle
             # Sort candidates by "criticality"? 
             # Chains with more remaining stages should go first?
-            chain_order = sorted(range(n_chains), key=lambda i: len(self.chains[i]), reverse=True)
+            chain_order = sorted(range(n_chains), key=lambda i: len(self.chains[i]), reverse=False)
             
             for i in chain_order:
                 if ready_cycle[i] > current_cycle:
@@ -182,7 +182,7 @@ class KernelBuilder:
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        UNROLL = 16
+        UNROLL = 16  # processes UNROLL * VLEN elements at once
         
         # Allocations
         tmp1 = self.alloc_scratch("tmp1")
@@ -216,27 +216,38 @@ class KernelBuilder:
             ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]),
         ]})
 
-        v_hash_consts = []
+        # Hash stage constants and possible fused multiply-add params
+        hash_infos = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1 = self.scratch_const(val1)
-            c3 = self.scratch_const(val3)
             vc1 = self.alloc_scratch(f"v_hc1_{hi}", VLEN)
-            vc3 = self.alloc_scratch(f"v_hc3_{hi}", VLEN)
-            v_hash_consts.append((vc1, vc3, c1, c3))
+            info = {"vc1": vc1, "c1": c1, "muladd": False}
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mul_const = (1 + (1 << val3)) % (2**32)
+                cmul = self.scratch_const(mul_const)
+                vmul = self.alloc_scratch(f"v_hmul_{hi}", VLEN)
+                info.update({"muladd": True, "vmul": vmul, "cmul": cmul})
+            else:
+                c3 = self.scratch_const(val3)
+                vc3 = self.alloc_scratch(f"v_hc3_{hi}", VLEN)
+                info.update({"vc3": vc3, "c3": c3})
+            hash_infos.append(info)
         
         self.emit_const_inits()
-        for i in range(0, len(v_hash_consts), 3):
-            valu_slots = []
-            for j in range(3):
-                if i + j < len(v_hash_consts):
-                    vc1, vc3, c1, c3 = v_hash_consts[i + j]
-                    valu_slots.append(("vbroadcast", vc1, c1))
-                    valu_slots.append(("vbroadcast", vc3, c3))
-            self.emit({"valu": valu_slots})
+        broadcasts = []
+        for info in hash_infos:
+            broadcasts.append(("vbroadcast", info["vc1"], info["c1"]))
+            if info["muladd"]:
+                broadcasts.append(("vbroadcast", info["vmul"], info["cmul"]))
+            else:
+                broadcasts.append(("vbroadcast", info["vc3"], info["c3"]))
+        for i in range(0, len(broadcasts), SLOT_LIMITS["valu"]):
+            chunk = broadcasts[i : i + SLOT_LIMITS["valu"]]
+            self.emit({"valu": chunk})
 
         self.emit({"flow": [("pause",)]})
 
-        # Loop Arrays
+        # Working vectors
         v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
         v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
         v_node = [self.alloc_scratch(f"v_node_{u}", VLEN) for u in range(UNROLL)]
@@ -244,119 +255,71 @@ class KernelBuilder:
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_{u}", VLEN) for u in range(UNROLL)]
         addr_scratch = [self.alloc_scratch(f"addr_{u}", VLEN) for u in range(UNROLL)]
         idx_base = [self.alloc_scratch(f"idx_base_{u}") for u in range(UNROLL)]
-        self.alloc_scratch("pad_idx", VLEN)
         val_base = [self.alloc_scratch(f"val_base_{u}") for u in range(UNROLL)]
-        self.alloc_scratch("pad_val", VLEN)
 
-        loop_counter = self.alloc_scratch("loop_counter")
-        batch_offset = self.alloc_scratch("batch_offset")
-        batch_size_const = self.scratch_const(batch_size)
-        total_iters = self.scratch_const(rounds * (batch_size // VLEN) // UNROLL)
-        stride_const = self.scratch_const(VLEN * UNROLL)
-
-        self.emit_const_inits()
-        v_offset_consts = self.alloc_scratch("v_offset_consts", UNROLL + VLEN)
-        for i in range(0, UNROLL, 2):
-            self.emit({"load": [("const", v_offset_consts + i, i * VLEN), ("const", v_offset_consts + i + 1, (i + 1) * VLEN)]})
-
-        self.emit({"alu": [("+", idx_base[0], self.scratch["inp_indices_p"], zero_const), ("+", val_base[0], self.scratch["inp_values_p"], zero_const)]})
-        self.emit({"load": [("const", loop_counter, 0), ("const", batch_offset, 0)]})
-
-        loop_start = len(self.instrs)
-        
-        # Scheduler Construction
-        sched = Scheduler(SLOT_LIMITS)
-        
-        v_tmp_base_idx = self.alloc_scratch("v_tmp_base_idx", VLEN)
-        v_tmp_base_val = self.alloc_scratch("v_tmp_base_val", VLEN)
-
-        # Manual breakdown:
-        # Common Prologue (Broadcast)
-        self.emit({"valu": [("vbroadcast", v_tmp_base_idx, idx_base[0]), ("vbroadcast", v_tmp_base_val, val_base[0])]})
-        
-        # Parallel Chains
+        # Build one round schedule (no idx/val loads or stores)
+        round_sched = Scheduler(SLOT_LIMITS)
         for u in range(UNROLL):
             stages = []
-            
-            # Stage 1: Calc Addrs
-            s_addr = []
-            s_addr.append(("valu", ("+", idx_base[u], v_tmp_base_idx, v_offset_consts + u)))
-            s_addr.append(("valu", ("+", val_base[u], v_tmp_base_val, v_offset_consts + u)))
-            stages.append(s_addr)
-            
-            # Stage 2: VLoad idx/val
-            s_vload = []
-            s_vload.append(("load", ("vload", v_idx[u], idx_base[u])))
-            s_vload.append(("load", ("vload", v_val[u], val_base[u])))
-            stages.append(s_vload)
-            
-            # Stage 3: Calc Scatter Addrs
-            s_scatter = []
-            # ("+", addr_scratch[u+i], v_forest_p, v_idx[u+i]) -> i is effectively 0 here as we unrolled u
-            s_scatter.append(("valu", ("+", addr_scratch[u], v_forest_p, v_idx[u])))
-            stages.append(s_scatter)
-            
-            # Stage 4: Gather (Load Offset)
+
+            # Compute forest addresses
+            stages.append([("valu", ("+", addr_scratch[u], v_forest_p, v_idx[u]))])
+
+            # Gather node values
             s_gather = []
             for i in range(VLEN):
                 s_gather.append(("load", ("load_offset", v_node[u], addr_scratch[u], i)))
             stages.append(s_gather)
-            
-            # Stage 5: XOR
-            s_xor = []
-            s_xor.append(("valu", ("^", v_val[u], v_val[u], v_node[u])))
-            stages.append(s_xor)
-            
-            # Stage 6+: Hash
+
+            # XOR with node
+            stages.append([("valu", ("^", v_val[u], v_val[u], v_node[u]))])
+
+            # Hash
             for hi, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
-                vc1, vc3, _, _ = v_hash_consts[hi]
-                # Hash Part 1
-                s_h1 = []
-                s_h1.append(("valu", (op1, v_tmp1[u], v_val[u], vc1)))
-                s_h1.append(("valu", (op3, v_tmp2[u], v_val[u], vc3)))
-                stages.append(s_h1)
-                # Hash Part 2
-                s_h2 = []
-                s_h2.append(("valu", (op2, v_val[u], v_tmp1[u], v_tmp2[u])))
-                stages.append(s_h2)
-            
-            # Index Update
-            # & -> + -> mul
+                hinfo = hash_infos[hi]
+                if hinfo["muladd"]:
+                    stages.append([("valu", ("multiply_add", v_val[u], v_val[u], hinfo["vmul"], hinfo["vc1"]))])
+                else:
+                    vc1, vc3 = hinfo["vc1"], hinfo["vc3"]
+                    stages.append([("valu", (op1, v_tmp1[u], v_val[u], vc1)), ("valu", (op3, v_tmp2[u], v_val[u], vc3))])
+                    stages.append([("valu", (op2, v_val[u], v_tmp1[u], v_tmp2[u]))])
+
+            # Index update
             stages.append([("valu", ("&", v_tmp1[u], v_val[u], v_one))])
             stages.append([("valu", ("+", v_tmp1[u], v_tmp1[u], v_one))])
             stages.append([("valu", ("multiply_add", v_idx[u], v_idx[u], v_two, v_tmp1[u]))])
-            
-            # Masking
-            # < -> - -> &
-            stages.append([("valu", ("<", v_tmp1[u], v_idx[u], v_n_nodes))])
-            stages.append([("valu", ("-", v_tmp1[u], v_zero, v_tmp1[u]))])
-            stages.append([("valu", ("&", v_idx[u], v_idx[u], v_tmp1[u]))])
-            
-            # Store
-            s_store = []
-            s_store.append(("store", ("vstore", idx_base[u], v_idx[u])))
-            s_store.append(("store", ("vstore", val_base[u], v_val[u])))
-            stages.append(s_store)
-            
-            sched.add_chain(stages)
-            
-        # Run Scheduler
-        scheduled_instrs = sched.schedule()
-        for instr in scheduled_instrs:
-            self.emit(instr)
 
-        # Loop Epilogue
-        self.emit({
-            "alu": [("+", batch_offset, batch_offset, stride_const), ("+", loop_counter, loop_counter, one_const)],
-        })
-        self.emit({"alu": [("%", batch_offset, batch_offset, batch_size_const), ("<", tmp1, loop_counter, total_iters)]})
-        self.emit({
-            "flow": [("cond_jump", tmp1, loop_start)],
-            "alu": [
-                ("+", idx_base[0], self.scratch["inp_indices_p"], batch_offset),
-                ("+", val_base[0], self.scratch["inp_values_p"], batch_offset)
-            ]
-        })
+            # Mask indices to tree size
+            stages.append([("valu", ("<", v_tmp1[u], v_idx[u], v_n_nodes))])
+            stages.append([("flow", ("vselect", v_idx[u], v_tmp1[u], v_idx[u], v_zero))])
+
+            round_sched.add_chain(stages)
+
+        round_instrs = round_sched.schedule()
+
+        # Process batch in groups of UNROLL * VLEN
+        group_size = UNROLL * VLEN
+        assert batch_size % group_size == 0, "Batch size must be multiple of UNROLL*VLEN"
+        n_groups = batch_size // group_size
+
+        for g in range(n_groups):
+            base = g * group_size
+            # Set pointers for this group
+            for u in range(UNROLL):
+                offset = base + u * VLEN
+                self.emit({"flow": [("add_imm", idx_base[u], self.scratch["inp_indices_p"], offset)]})
+                self.emit({"flow": [("add_imm", val_base[u], self.scratch["inp_values_p"], offset)]})
+                self.emit({"load": [("vload", v_idx[u], idx_base[u]), ("vload", v_val[u], val_base[u])]})
+
+            # Run all rounds in-place
+            for _ in range(rounds):
+                for instr in round_instrs:
+                    self.emit(instr)
+
+            # Write back
+            for u in range(UNROLL):
+                self.emit({"store": [("vstore", idx_base[u], v_idx[u]), ("vstore", val_base[u], v_val[u])]})
+
         self.emit({"flow": [("pause",)]})
 
 BASELINE = 147734
