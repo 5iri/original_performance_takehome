@@ -182,7 +182,7 @@ class KernelBuilder:
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        UNROLL = 16  # processes UNROLL * VLEN elements at once
+        UNROLL = 32  # processes UNROLL * VLEN elements at once
         
         # Allocations
         tmp1 = self.alloc_scratch("tmp1")
@@ -250,7 +250,6 @@ class KernelBuilder:
         # Working vectors
         v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
         v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
-        v_node = [self.alloc_scratch(f"v_node_{u}", VLEN) for u in range(UNROLL)]
         v_tmp1 = [self.alloc_scratch(f"v_tmp1_{u}", VLEN) for u in range(UNROLL)]
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_{u}", VLEN) for u in range(UNROLL)]
         addr_scratch = [self.alloc_scratch(f"addr_{u}", VLEN) for u in range(UNROLL)]
@@ -287,11 +286,11 @@ class KernelBuilder:
                 # Gather node values
                 s_gather = []
                 for i in range(VLEN):
-                    s_gather.append(("load", ("load_offset", v_node[u], addr_scratch[u], i)))
+                    s_gather.append(("load", ("load_offset", v_tmp2[u], addr_scratch[u], i)))
                 stages.append(s_gather)
 
-                # XOR with node
-                stages.append([("valu", ("^", v_val[u], v_val[u], v_node[u]))])
+                # XOR with node (node currently in v_tmp2)
+                stages.append([("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))])
 
                 append_hash_and_update(stages, u, do_wrap)
                 round_sched.add_chain(stages)
