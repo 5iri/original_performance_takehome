@@ -200,6 +200,7 @@ class KernelBuilder:
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        vlen_const = self.scratch_const(VLEN)
         self.emit_const_inits()
 
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -305,13 +306,22 @@ class KernelBuilder:
         assert batch_size % group_size == 0, "Batch size must be multiple of UNROLL*VLEN"
         n_groups = batch_size // group_size
 
+        group_idx_base = self.alloc_scratch("group_idx_base")
+        group_val_base = self.alloc_scratch("group_val_base")
+
         for g in range(n_groups):
             base = g * group_size
-            # Set pointers for this group
+            # Base pointers for this group
+            self.emit({"flow": [("add_imm", group_idx_base, self.scratch["inp_indices_p"], base)]})
+            self.emit({"flow": [("add_imm", group_val_base, self.scratch["inp_values_p"], base)]})
+
+            # Lane 0 bases
+            self.emit({"alu": [("+", idx_base[0], group_idx_base, zero_const), ("+", val_base[0], group_val_base, zero_const)]})
+            # Remaining lanes via stride adds (VLEN), serialized to honor deps
+            for u in range(1, UNROLL):
+                self.emit({"alu": [("+", idx_base[u], idx_base[u - 1], vlen_const), ("+", val_base[u], val_base[u - 1], vlen_const)]})
+
             for u in range(UNROLL):
-                offset = base + u * VLEN
-                self.emit({"flow": [("add_imm", idx_base[u], self.scratch["inp_indices_p"], offset)]})
-                self.emit({"flow": [("add_imm", val_base[u], self.scratch["inp_values_p"], offset)]})
                 self.emit({"load": [("vload", v_idx[u], idx_base[u]), ("vload", v_val[u], val_base[u])]})
 
             # Run all rounds in-place
