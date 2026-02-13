@@ -68,50 +68,34 @@ class Scheduler:
                 
             bundle = defaultdict(list)
             slots_left = copy(self.limits)
-            
-            # Simple greedy: iterate chains, try to schedule ready instrs
             progress = False
-            
-            # We iterate multiple times to fill holes? No, just once per cycle
-            # Sort candidates by "criticality"? 
-            # Chains with more remaining stages should go first?
-            chain_order = sorted(range(n_chains), key=lambda i: len(self.chains[i]), reverse=False)
-            
-            for i in chain_order:
-                if ready_cycle[i] > current_cycle:
-                    continue
-                
-                if not pending_instrs[i] and self.chains[i]:
-                    # Advance to next stage if current empty
-                    # But we only advance when PREVIOUS stage completed in PREVIOUS cycle?
-                    # My logic: pending_instrs holds CURRENT stage.
-                    # Once empty, we wait latency (1 cycle) then load next.
-                    # So if empty here, it means we finished stage in prev cycle.
-                    # Wait, if we finished in cycle T, result ready T+1.
-                    # So we can load next stage now.
-                     pending_instrs[i] = deque(self.chains[i].popleft())
-                
-                # Try to schedule instrs from current stage
-                while pending_instrs[i]:
-                    instr = pending_instrs[i][0]
-                    # instr is (engine, slot) or just slot? 
-                    # My chains will store (engine, slot)
-                    engine, slot = instr
-                    
+
+            # Multi-pass packing: keep scanning chains in the same cycle to
+            # fill holes caused by per-engine contention.
+            while True:
+                pass_progress = False
+                for i in range(n_chains):
+                    if ready_cycle[i] > current_cycle:
+                        continue
+
+                    if not pending_instrs[i] and self.chains[i]:
+                        pending_instrs[i] = deque(self.chains[i].popleft())
+
+                    if not pending_instrs[i]:
+                        continue
+
+                    engine, slot = pending_instrs[i][0]
                     if slots_left[engine] > 0:
-                        # Schedule it
                         bundle[engine].append(slot)
                         slots_left[engine] -= 1
                         pending_instrs[i].popleft()
                         progress = True
-                        
-                        # Update readiness for NEXT stage
-                        # If this was the last instr of the stage, next stage ready at T+1
+                        pass_progress = True
                         if not pending_instrs[i]:
                             ready_cycle[i] = current_cycle + 1
-                    else:
-                        # Engine full, stop this chain for this cycle
-                        break
+
+                if not pass_progress:
+                    break
             
             # Emit bundle
             if bundle:
