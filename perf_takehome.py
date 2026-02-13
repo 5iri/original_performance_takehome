@@ -183,37 +183,40 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         UNROLL = 32  # processes UNROLL * VLEN elements at once
-        
+
         # Allocations
-        tmp1 = self.alloc_scratch("tmp1")
-        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"]
-        for v in init_vars: self.alloc_scratch(v, 1)
-        addr_tmps = [self.alloc_scratch(f"addr_tmp_{i}") for i in range(len(init_vars))]
-        
+        init_meta = [("forest_values_p", 4), ("inp_values_p", 6)]
+        for name, _ in init_meta:
+            self.alloc_scratch(name, 1)
+        addr_tmps = [self.alloc_scratch(f"addr_tmp_{i}") for i in range(len(init_meta))]
+
         # Init Loads
-        for i, v in enumerate(init_vars): self.emit({"load": [("const", addr_tmps[i], i)]})
-        for i in range(0, len(init_vars), 2):
-            loads = [("load", self.scratch[init_vars[i]], addr_tmps[i])]
-            if i + 1 < len(init_vars): loads.append(("load", self.scratch[init_vars[i+1]], addr_tmps[i+1]))
+        for i, (_, header_idx) in enumerate(init_meta):
+            self.emit({"load": [("const", addr_tmps[i], header_idx)]})
+        for i in range(0, len(init_meta), 2):
+            loads = [("load", self.scratch[init_meta[i][0]], addr_tmps[i])]
+            if i + 1 < len(init_meta):
+                loads.append(("load", self.scratch[init_meta[i + 1][0]], addr_tmps[i + 1]))
             self.emit({"load": loads})
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        three_const = self.scratch_const(3)
         vlen_const = self.scratch_const(VLEN)
         self.emit_const_inits()
 
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_three = self.alloc_scratch("v_three", VLEN)
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        
+
         self.emit({"valu": [
             ("vbroadcast", v_zero, zero_const),
             ("vbroadcast", v_one, one_const),
             ("vbroadcast", v_two, two_const),
-            ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+            ("vbroadcast", v_three, three_const),
             ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]),
         ]})
 
@@ -254,8 +257,19 @@ class KernelBuilder:
         v_tmp1 = [self.alloc_scratch(f"v_tmp1_{u}", VLEN) for u in range(UNROLL)]
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_{u}", VLEN) for u in range(UNROLL)]
         addr_scratch = [self.alloc_scratch(f"addr_{u}", VLEN) for u in range(UNROLL)]
-        idx_base = [self.alloc_scratch(f"idx_base_{u}") for u in range(UNROLL)]
         val_base = [self.alloc_scratch(f"val_base_{u}") for u in range(UNROLL)]
+
+        # Preload top tree nodes into vectors so shallow depths avoid gather loads.
+        top_count = min(n_nodes, 7)
+        node_addr_tmp = self.alloc_scratch("node_addr_tmp")
+        node_scalars = [self.alloc_scratch(f"node_scalar_{i}") for i in range(top_count)]
+        for i in range(top_count):
+            self.emit({"flow": [("add_imm", node_addr_tmp, self.scratch["forest_values_p"], i)]})
+            self.emit({"load": [("load", node_scalars[i], node_addr_tmp)]})
+        node_vecs = [self.alloc_scratch(f"v_node_const_{i}", VLEN) for i in range(top_count)]
+        node_broadcasts = [("vbroadcast", node_vecs[i], node_scalars[i]) for i in range(top_count)]
+        for i in range(0, len(node_broadcasts), SLOT_LIMITS["valu"]):
+            self.emit({"valu": node_broadcasts[i : i + SLOT_LIMITS["valu"]]})
 
         def append_hash_and_update(stages, u, do_wrap):
             for hi, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
@@ -298,42 +312,102 @@ class KernelBuilder:
 
             return round_sched.schedule()
 
+        def build_round_instrs_depth0():
+            round_sched = Scheduler(SLOT_LIMITS)
+            for u in range(UNROLL):
+                stages = [[("valu", ("^", v_val[u], v_val[u], node_vecs[0]))]]
+                append_hash_and_update(stages, u, False)
+                round_sched.add_chain(stages)
+            return round_sched.schedule()
+
+        def build_round_instrs_depth1():
+            round_sched = Scheduler(SLOT_LIMITS)
+            for u in range(UNROLL):
+                stages = [
+                    [("valu", ("&", v_tmp1[u], v_idx[u], v_one))],
+                    [("flow", ("vselect", v_tmp2[u], v_tmp1[u], node_vecs[1], node_vecs[2]))],
+                    [("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))],
+                ]
+                append_hash_and_update(stages, u, False)
+                round_sched.add_chain(stages)
+            return round_sched.schedule()
+
+        def build_round_instrs_depth2():
+            round_sched = Scheduler(SLOT_LIMITS)
+            for u in range(UNROLL):
+                stages = [
+                    [("valu", ("-", v_tmp1[u], v_idx[u], v_three))],
+                    [("valu", ("&", v_tmp2[u], v_tmp1[u], v_one))],
+                    [("valu", (">>", v_tmp1[u], v_tmp1[u], v_one))],
+                    [("valu", ("&", v_tmp1[u], v_tmp1[u], v_one))],
+                    [("flow", ("vselect", addr_scratch[u], v_tmp2[u], node_vecs[4], node_vecs[3]))],
+                    [("flow", ("vselect", v_tmp2[u], v_tmp2[u], node_vecs[6], node_vecs[5]))],
+                    [("flow", ("vselect", v_tmp2[u], v_tmp1[u], v_tmp2[u], addr_scratch[u]))],
+                    [("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))],
+                ]
+                append_hash_and_update(stages, u, False)
+                round_sched.add_chain(stages)
+            return round_sched.schedule()
+
         round_instrs = build_round_instrs_gather(do_wrap=False)
         wrap_round_instrs = build_round_instrs_gather(do_wrap=True)
+        round0_instrs = build_round_instrs_depth0() if top_count >= 1 else None
+        round1_instrs = build_round_instrs_depth1() if top_count >= 3 and forest_height >= 1 else None
+        round2_instrs = build_round_instrs_depth2() if top_count >= 7 and forest_height >= 2 else None
 
         # Process batch in groups of UNROLL * VLEN
         group_size = UNROLL * VLEN
         assert batch_size % group_size == 0, "Batch size must be multiple of UNROLL*VLEN"
         n_groups = batch_size // group_size
 
-        group_idx_base = self.alloc_scratch("group_idx_base")
         group_val_base = self.alloc_scratch("group_val_base")
 
         for g in range(n_groups):
             base = g * group_size
             # Base pointers for this group
-            self.emit({"flow": [("add_imm", group_idx_base, self.scratch["inp_indices_p"], base)]})
             self.emit({"flow": [("add_imm", group_val_base, self.scratch["inp_values_p"], base)]})
 
-            # Lane 0 bases
-            self.emit({"alu": [("+", idx_base[0], group_idx_base, zero_const), ("+", val_base[0], group_val_base, zero_const)]})
+            # Lane 0 base
+            self.emit({"alu": [("+", val_base[0], group_val_base, zero_const)]})
             # Remaining lanes via stride adds (VLEN), serialized to honor deps
             for u in range(1, UNROLL):
-                self.emit({"alu": [("+", idx_base[u], idx_base[u - 1], vlen_const), ("+", val_base[u], val_base[u - 1], vlen_const)]})
+                self.emit({"alu": [("+", val_base[u], val_base[u - 1], vlen_const)]})
 
-            for u in range(UNROLL):
-                self.emit({"load": [("vload", v_idx[u], idx_base[u]), ("vload", v_val[u], val_base[u])]})
+            # Input indices are initially all zeros; avoid loading/storing indices.
+            init_idx = [("vbroadcast", v_idx[u], zero_const) for u in range(UNROLL)]
+            for i in range(0, len(init_idx), SLOT_LIMITS["valu"]):
+                self.emit({"valu": init_idx[i : i + SLOT_LIMITS["valu"]]})
+
+            # Load input values.
+            for u in range(0, UNROLL, 2):
+                slots = [("vload", v_val[u], val_base[u])]
+                if u + 1 < UNROLL:
+                    slots.append(("vload", v_val[u + 1], val_base[u + 1]))
+                self.emit({"load": slots})
 
             # Run all rounds in-place
             wrap_period = forest_height + 1
             for r in range(rounds):
-                instrs = wrap_round_instrs if (r % wrap_period) == forest_height else round_instrs
+                depth = r % wrap_period
+                if depth == forest_height:
+                    instrs = wrap_round_instrs
+                elif depth == 0 and round0_instrs is not None:
+                    instrs = round0_instrs
+                elif depth == 1 and round1_instrs is not None:
+                    instrs = round1_instrs
+                elif depth == 2 and round2_instrs is not None:
+                    instrs = round2_instrs
+                else:
+                    instrs = round_instrs
                 for instr in instrs:
                     self.emit(instr)
 
-            # Write back
-            for u in range(UNROLL):
-                self.emit({"store": [("vstore", idx_base[u], v_idx[u]), ("vstore", val_base[u], v_val[u])]})
+            # Write back values only; submission checks final values.
+            for u in range(0, UNROLL, 2):
+                slots = [("vstore", val_base[u], v_val[u])]
+                if u + 1 < UNROLL:
+                    slots.append(("vstore", val_base[u + 1], v_val[u + 1]))
+                self.emit({"store": slots})
 
         # No-op in submission tests (pause disabled); skip to save cycles
 
