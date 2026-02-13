@@ -202,22 +202,15 @@ class KernelBuilder:
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
-        three_const = self.scratch_const(3)
         vlen_const = self.scratch_const(VLEN)
         self.emit_const_inits()
 
-        v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
-        v_three = self.alloc_scratch("v_three", VLEN)
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
 
         self.emit({"valu": [
-            ("vbroadcast", v_zero, zero_const),
             ("vbroadcast", v_one, one_const),
             ("vbroadcast", v_two, two_const),
-            ("vbroadcast", v_three, three_const),
-            ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]),
         ]})
 
         # Hash stage constants and possible fused multiply-add params
@@ -254,51 +247,89 @@ class KernelBuilder:
         # Working vectors
         v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
         v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
-        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{u}", VLEN) for u in range(UNROLL)]
+        v_tmp = [self.alloc_scratch(f"v_tmp_{u}", VLEN) for u in range(UNROLL)]
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_{u}", VLEN) for u in range(UNROLL)]
         addr_scratch = [self.alloc_scratch(f"addr_{u}", VLEN) for u in range(UNROLL)]
-        val_base = [self.alloc_scratch(f"val_base_{u}") for u in range(UNROLL)]
+        # Reuse v_idx lane-0 slots as transient scalar address registers for loads/stores.
+        val_base = [v_idx[u] for u in range(UNROLL)]
 
         # Preload top tree nodes into vectors so shallow depths avoid gather loads.
         top_count = min(n_nodes, 7)
         node_addr_tmp = self.alloc_scratch("node_addr_tmp")
-        node_scalars = [self.alloc_scratch(f"node_scalar_{i}") for i in range(top_count)]
+        node_scalar_tmp = self.alloc_scratch("node_scalar_tmp")
+        node_vecs = [self.alloc_scratch(f"v_node_const_{i}", VLEN) for i in range(top_count)]
         for i in range(top_count):
             self.emit({"flow": [("add_imm", node_addr_tmp, self.scratch["forest_values_p"], i)]})
-            self.emit({"load": [("load", node_scalars[i], node_addr_tmp)]})
-        node_vecs = [self.alloc_scratch(f"v_node_const_{i}", VLEN) for i in range(top_count)]
-        node_broadcasts = [("vbroadcast", node_vecs[i], node_scalars[i]) for i in range(top_count)]
-        for i in range(0, len(node_broadcasts), SLOT_LIMITS["valu"]):
-            self.emit({"valu": node_broadcasts[i : i + SLOT_LIMITS["valu"]]})
+            self.emit({"load": [("load", node_scalar_tmp, node_addr_tmp)]})
+            self.emit({"valu": [("vbroadcast", node_vecs[i], node_scalar_tmp)]})
 
-        def append_hash_and_update(stages, u, update_kind: str):
+        # Base pointer vectors for gather rounds at depths >= 3.
+        level_base_vecs = {}
+        if forest_height >= 3:
+            level_base_tmp0 = self.alloc_scratch("level_base_tmp0")
+            level_base_tmp1 = self.alloc_scratch("level_base_tmp1")
+            depths = list(range(3, forest_height + 1))
+            for depth in depths:
+                level_base_vecs[depth] = self.alloc_scratch(f"v_level_base_{depth}", VLEN)
+
+            for i in range(0, len(depths), 2):
+                d0 = depths[i]
+                self.emit(
+                    {
+                        "flow": [
+                            (
+                                "add_imm",
+                                level_base_tmp0,
+                                self.scratch["forest_values_p"],
+                                (1 << d0) - 1,
+                            )
+                        ]
+                    }
+                )
+                vb = [("vbroadcast", level_base_vecs[d0], level_base_tmp0)]
+                if i + 1 < len(depths):
+                    d1 = depths[i + 1]
+                    self.emit(
+                        {
+                            "flow": [
+                                (
+                                    "add_imm",
+                                    level_base_tmp1,
+                                    self.scratch["forest_values_p"],
+                                    (1 << d1) - 1,
+                                )
+                            ]
+                        }
+                    )
+                    vb.append(("vbroadcast", level_base_vecs[d1], level_base_tmp1))
+                self.emit({"valu": vb})
+
+        def append_hash_and_update(stages, u, update_kind: str, idx_src=None):
             for hi, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
                 hinfo = hash_infos[hi]
                 if hinfo["muladd"]:
                     stages.append([("valu", ("multiply_add", v_val[u], v_val[u], hinfo["vmul"], hinfo["vc1"]))])
                 else:
                     vc1, vc3 = hinfo["vc1"], hinfo["vc3"]
-                    stages.append([("valu", (op1, v_tmp1[u], v_val[u], vc1)), ("valu", (op3, v_tmp2[u], v_val[u], vc3))])
-                    stages.append([("valu", (op2, v_val[u], v_tmp1[u], v_tmp2[u]))])
+                    stages.append([("valu", (op1, v_tmp[u], v_val[u], vc1)), ("valu", (op3, v_tmp2[u], v_val[u], vc3))])
+                    stages.append([("valu", (op2, v_val[u], v_tmp[u], v_tmp2[u]))])
 
-            if update_kind == "normal":
-                # Index update
-                stages.append([("valu", ("&", v_tmp1[u], v_val[u], v_one))])
-                stages.append([("valu", ("+", v_tmp1[u], v_tmp1[u], v_one))])
-                stages.append([("valu", ("multiply_add", v_idx[u], v_idx[u], v_two, v_tmp1[u]))])
+            if update_kind == "path":
+                src = idx_src if idx_src is not None else v_idx[u]
+                # idx_next = 2 * idx + (val & 1)
+                stages.append([("valu", ("&", v_tmp[u], v_val[u], v_one))])
+                stages.append([("valu", ("multiply_add", v_idx[u], src, v_two, v_tmp[u]))])
             elif update_kind == "depth0":
-                # At depth 0 the current index is always 0, so idx_next = (val & 1) + 1.
+                # Path at depth 1 is just parity bit from depth 0.
                 stages.append([("valu", ("&", v_idx[u], v_val[u], v_one))])
-                stages.append([("valu", ("+", v_idx[u], v_idx[u], v_one))])
             elif update_kind == "none":
-                # Wrapping depth: the next round is depth 0 and does not read old idx.
                 return
             else:
                 raise ValueError(f"Unknown update kind: {update_kind}")
 
-        def append_gather_round(stages, u, update_kind: str):
+        def append_gather_round(stages, u, depth: int, update_kind: str):
             # Compute forest addresses
-            stages.append([("valu", ("+", addr_scratch[u], v_forest_p, v_idx[u]))])
+            stages.append([("valu", ("+", addr_scratch[u], level_base_vecs[depth], v_idx[u]))])
 
             # Gather node values
             s_gather = []
@@ -306,7 +337,7 @@ class KernelBuilder:
                 s_gather.append(("load", ("load_offset", v_tmp2[u], addr_scratch[u], i)))
             stages.append(s_gather)
 
-            # XOR with node (node currently in v_tmp2)
+            # XOR with node
             stages.append([("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))])
             append_hash_and_update(stages, u, update_kind)
 
@@ -317,8 +348,8 @@ class KernelBuilder:
         def append_depth1_round(stages, u, update_kind: str):
             stages.extend(
                 [
-                    [("valu", ("&", v_tmp1[u], v_idx[u], v_one))],
-                    [("flow", ("vselect", v_tmp2[u], v_tmp1[u], node_vecs[1], node_vecs[2]))],
+                    # v_idx lane is 0 for node 1 and 1 for node 2.
+                    [("flow", ("vselect", v_tmp2[u], v_idx[u], node_vecs[2], node_vecs[1]))],
                     [("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))],
                 ]
             )
@@ -327,14 +358,12 @@ class KernelBuilder:
         def append_depth2_round(stages, u, update_kind: str):
             stages.extend(
                 [
-                    [("valu", ("-", v_tmp1[u], v_idx[u], v_three))],
-                    [("valu", ("&", v_tmp2[u], v_tmp1[u], v_one))],
-                    [("valu", (">>", v_tmp1[u], v_tmp1[u], v_one))],
-                    [("valu", ("&", v_tmp1[u], v_tmp1[u], v_one))],
-                    [("flow", ("vselect", addr_scratch[u], v_tmp2[u], node_vecs[4], node_vecs[3]))],
-                    [("flow", ("vselect", v_tmp2[u], v_tmp2[u], node_vecs[6], node_vecs[5]))],
-                    [("flow", ("vselect", v_tmp2[u], v_tmp1[u], v_tmp2[u], addr_scratch[u]))],
-                    [("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))],
+                    [("valu", ("&", v_tmp[u], v_idx[u], v_one))],
+                    [("valu", (">>", v_tmp2[u], v_idx[u], v_one))],
+                    [("flow", ("vselect", addr_scratch[u], v_tmp[u], node_vecs[4], node_vecs[3]))],
+                    [("flow", ("vselect", v_tmp[u], v_tmp[u], node_vecs[6], node_vecs[5]))],
+                    [("flow", ("vselect", v_tmp[u], v_tmp2[u], v_tmp[u], addr_scratch[u]))],
+                    [("valu", ("^", v_val[u], v_val[u], v_tmp[u]))],
                 ]
             )
             append_hash_and_update(stages, u, update_kind)
@@ -349,16 +378,20 @@ class KernelBuilder:
                 if depth == forest_height:
                     if depth == 0 and top_count >= 1:
                         append_depth0_round(stages, u, "none")
+                    elif depth == 1 and top_count >= 3 and forest_height >= 1:
+                        append_depth1_round(stages, u, "none")
+                    elif depth == 2 and top_count >= 7 and forest_height >= 2:
+                        append_depth2_round(stages, u, "none")
                     else:
-                        append_gather_round(stages, u, "none")
+                        append_gather_round(stages, u, depth, "none")
                 elif depth == 0 and top_count >= 1:
                     append_depth0_round(stages, u, "depth0")
                 elif depth == 1 and top_count >= 3 and forest_height >= 1:
-                    append_depth1_round(stages, u, "normal")
+                    append_depth1_round(stages, u, "path")
                 elif depth == 2 and top_count >= 7 and forest_height >= 2:
-                    append_depth2_round(stages, u, "normal")
+                    append_depth2_round(stages, u, "path")
                 else:
-                    append_gather_round(stages, u, "normal")
+                    append_gather_round(stages, u, depth, "path")
             round_sched.add_chain(stages)
         all_round_instrs = round_sched.schedule()
 
@@ -369,16 +402,42 @@ class KernelBuilder:
 
         group_val_base = self.alloc_scratch("group_val_base")
 
+        def emit_val_base_setup(base_reg):
+            # Build 64/128/192 offsets from VLEN (=8) once per setup, then
+            # advance four independent pointer chains to fill all 32 bases.
+            self.emit({"alu": [("+", val_base[8], vlen_const, vlen_const)]})
+            self.emit({"alu": [("+", val_base[8], val_base[8], val_base[8])]})
+            self.emit({"alu": [("+", val_base[8], val_base[8], val_base[8])]})
+            self.emit({"alu": [("+", val_base[16], val_base[8], val_base[8])]})
+            self.emit({"alu": [("+", val_base[24], val_base[16], val_base[8])]})
+            self.emit(
+                {
+                    "alu": [
+                        ("+", val_base[0], base_reg, zero_const),
+                        ("+", val_base[8], base_reg, val_base[8]),
+                        ("+", val_base[16], base_reg, val_base[16]),
+                        ("+", val_base[24], base_reg, val_base[24]),
+                    ]
+                }
+            )
+            for i in range(1, 8):
+                self.emit(
+                    {
+                        "alu": [
+                            ("+", val_base[i], val_base[i - 1], vlen_const),
+                            ("+", val_base[8 + i], val_base[8 + i - 1], vlen_const),
+                            ("+", val_base[16 + i], val_base[16 + i - 1], vlen_const),
+                            ("+", val_base[24 + i], val_base[24 + i - 1], vlen_const),
+                        ]
+                    }
+                )
+
         for g in range(n_groups):
             base = g * group_size
             # Base pointers for this group
             self.emit({"flow": [("add_imm", group_val_base, self.scratch["inp_values_p"], base)]})
 
-            # Lane 0 base
-            self.emit({"alu": [("+", val_base[0], group_val_base, zero_const)]})
-            # Remaining lanes via stride adds (VLEN), serialized to honor deps
-            for u in range(1, UNROLL):
-                self.emit({"alu": [("+", val_base[u], val_base[u - 1], vlen_const)]})
+            emit_val_base_setup(group_val_base)
 
             # Load input values.
             for u in range(0, UNROLL, 2):
@@ -390,6 +449,9 @@ class KernelBuilder:
             # Run all rounds in-place.
             for instr in all_round_instrs:
                 self.emit(instr)
+
+            # Recompute value pointers because v_idx registers were reused during rounds.
+            emit_val_base_setup(group_val_base)
 
             # Write back values only; submission checks final values.
             for u in range(0, UNROLL, 2):
