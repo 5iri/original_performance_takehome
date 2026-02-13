@@ -271,7 +271,7 @@ class KernelBuilder:
         for i in range(0, len(node_broadcasts), SLOT_LIMITS["valu"]):
             self.emit({"valu": node_broadcasts[i : i + SLOT_LIMITS["valu"]]})
 
-        def append_hash_and_update(stages, u, do_wrap):
+        def append_hash_and_update(stages, u, update_kind: str):
             for hi, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
                 hinfo = hash_infos[hi]
                 if hinfo["muladd"]:
@@ -281,61 +281,52 @@ class KernelBuilder:
                     stages.append([("valu", (op1, v_tmp1[u], v_val[u], vc1)), ("valu", (op3, v_tmp2[u], v_val[u], vc3))])
                     stages.append([("valu", (op2, v_val[u], v_tmp1[u], v_tmp2[u]))])
 
-            if do_wrap:
-                # After last depth, all indices wrap to 0; skip idx update
-                stages.append([("valu", ("+", v_idx[u], v_zero, v_zero))])
-            else:
+            if update_kind == "normal":
                 # Index update
                 stages.append([("valu", ("&", v_tmp1[u], v_val[u], v_one))])
                 stages.append([("valu", ("+", v_tmp1[u], v_tmp1[u], v_one))])
                 stages.append([("valu", ("multiply_add", v_idx[u], v_idx[u], v_two, v_tmp1[u]))])
+            elif update_kind == "depth0":
+                # At depth 0 the current index is always 0, so idx_next = (val & 1) + 1.
+                stages.append([("valu", ("&", v_idx[u], v_val[u], v_one))])
+                stages.append([("valu", ("+", v_idx[u], v_idx[u], v_one))])
+            elif update_kind == "none":
+                # Wrapping depth: the next round is depth 0 and does not read old idx.
+                return
+            else:
+                raise ValueError(f"Unknown update kind: {update_kind}")
 
-        def build_round_instrs_gather(do_wrap: bool):
-            round_sched = Scheduler(SLOT_LIMITS)
-            for u in range(UNROLL):
-                stages = []
+        def append_gather_round(stages, u, update_kind: str):
+            # Compute forest addresses
+            stages.append([("valu", ("+", addr_scratch[u], v_forest_p, v_idx[u]))])
 
-                # Compute forest addresses
-                stages.append([("valu", ("+", addr_scratch[u], v_forest_p, v_idx[u]))])
+            # Gather node values
+            s_gather = []
+            for i in range(VLEN):
+                s_gather.append(("load", ("load_offset", v_tmp2[u], addr_scratch[u], i)))
+            stages.append(s_gather)
 
-                # Gather node values
-                s_gather = []
-                for i in range(VLEN):
-                    s_gather.append(("load", ("load_offset", v_tmp2[u], addr_scratch[u], i)))
-                stages.append(s_gather)
+            # XOR with node (node currently in v_tmp2)
+            stages.append([("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))])
+            append_hash_and_update(stages, u, update_kind)
 
-                # XOR with node (node currently in v_tmp2)
-                stages.append([("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))])
+        def append_depth0_round(stages, u, update_kind: str):
+            stages.append([("valu", ("^", v_val[u], v_val[u], node_vecs[0]))])
+            append_hash_and_update(stages, u, update_kind)
 
-                append_hash_and_update(stages, u, do_wrap)
-                round_sched.add_chain(stages)
-
-            return round_sched.schedule()
-
-        def build_round_instrs_depth0():
-            round_sched = Scheduler(SLOT_LIMITS)
-            for u in range(UNROLL):
-                stages = [[("valu", ("^", v_val[u], v_val[u], node_vecs[0]))]]
-                append_hash_and_update(stages, u, False)
-                round_sched.add_chain(stages)
-            return round_sched.schedule()
-
-        def build_round_instrs_depth1():
-            round_sched = Scheduler(SLOT_LIMITS)
-            for u in range(UNROLL):
-                stages = [
+        def append_depth1_round(stages, u, update_kind: str):
+            stages.extend(
+                [
                     [("valu", ("&", v_tmp1[u], v_idx[u], v_one))],
                     [("flow", ("vselect", v_tmp2[u], v_tmp1[u], node_vecs[1], node_vecs[2]))],
                     [("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))],
                 ]
-                append_hash_and_update(stages, u, False)
-                round_sched.add_chain(stages)
-            return round_sched.schedule()
+            )
+            append_hash_and_update(stages, u, update_kind)
 
-        def build_round_instrs_depth2():
-            round_sched = Scheduler(SLOT_LIMITS)
-            for u in range(UNROLL):
-                stages = [
+        def append_depth2_round(stages, u, update_kind: str):
+            stages.extend(
+                [
                     [("valu", ("-", v_tmp1[u], v_idx[u], v_three))],
                     [("valu", ("&", v_tmp2[u], v_tmp1[u], v_one))],
                     [("valu", (">>", v_tmp1[u], v_tmp1[u], v_one))],
@@ -345,15 +336,31 @@ class KernelBuilder:
                     [("flow", ("vselect", v_tmp2[u], v_tmp1[u], v_tmp2[u], addr_scratch[u]))],
                     [("valu", ("^", v_val[u], v_val[u], v_tmp2[u]))],
                 ]
-                append_hash_and_update(stages, u, False)
-                round_sched.add_chain(stages)
-            return round_sched.schedule()
+            )
+            append_hash_and_update(stages, u, update_kind)
 
-        round_instrs = build_round_instrs_gather(do_wrap=False)
-        wrap_round_instrs = build_round_instrs_gather(do_wrap=True)
-        round0_instrs = build_round_instrs_depth0() if top_count >= 1 else None
-        round1_instrs = build_round_instrs_depth1() if top_count >= 3 and forest_height >= 1 else None
-        round2_instrs = build_round_instrs_depth2() if top_count >= 7 and forest_height >= 2 else None
+        # Build one global schedule across all rounds to avoid full-round barriers.
+        wrap_period = forest_height + 1
+        round_sched = Scheduler(SLOT_LIMITS)
+        for u in range(UNROLL):
+            stages = []
+            for r in range(rounds):
+                depth = r % wrap_period
+                if depth == forest_height:
+                    if depth == 0 and top_count >= 1:
+                        append_depth0_round(stages, u, "none")
+                    else:
+                        append_gather_round(stages, u, "none")
+                elif depth == 0 and top_count >= 1:
+                    append_depth0_round(stages, u, "depth0")
+                elif depth == 1 and top_count >= 3 and forest_height >= 1:
+                    append_depth1_round(stages, u, "normal")
+                elif depth == 2 and top_count >= 7 and forest_height >= 2:
+                    append_depth2_round(stages, u, "normal")
+                else:
+                    append_gather_round(stages, u, "normal")
+            round_sched.add_chain(stages)
+        all_round_instrs = round_sched.schedule()
 
         # Process batch in groups of UNROLL * VLEN
         group_size = UNROLL * VLEN
@@ -373,11 +380,6 @@ class KernelBuilder:
             for u in range(1, UNROLL):
                 self.emit({"alu": [("+", val_base[u], val_base[u - 1], vlen_const)]})
 
-            # Input indices are initially all zeros; avoid loading/storing indices.
-            init_idx = [("vbroadcast", v_idx[u], zero_const) for u in range(UNROLL)]
-            for i in range(0, len(init_idx), SLOT_LIMITS["valu"]):
-                self.emit({"valu": init_idx[i : i + SLOT_LIMITS["valu"]]})
-
             # Load input values.
             for u in range(0, UNROLL, 2):
                 slots = [("vload", v_val[u], val_base[u])]
@@ -385,22 +387,9 @@ class KernelBuilder:
                     slots.append(("vload", v_val[u + 1], val_base[u + 1]))
                 self.emit({"load": slots})
 
-            # Run all rounds in-place
-            wrap_period = forest_height + 1
-            for r in range(rounds):
-                depth = r % wrap_period
-                if depth == forest_height:
-                    instrs = wrap_round_instrs
-                elif depth == 0 and round0_instrs is not None:
-                    instrs = round0_instrs
-                elif depth == 1 and round1_instrs is not None:
-                    instrs = round1_instrs
-                elif depth == 2 and round2_instrs is not None:
-                    instrs = round2_instrs
-                else:
-                    instrs = round_instrs
-                for instr in instrs:
-                    self.emit(instr)
+            # Run all rounds in-place.
+            for instr in all_round_instrs:
+                self.emit(instr)
 
             # Write back values only; submission checks final values.
             for u in range(0, UNROLL, 2):
