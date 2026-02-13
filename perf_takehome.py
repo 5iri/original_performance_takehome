@@ -359,6 +359,7 @@ class KernelBuilder:
             stages = []
             for r in range(rounds):
                 depth = r % wrap_period
+                is_last_round = r == rounds - 1
                 if depth == forest_height:
                     if depth == 0 and top_count >= 1:
                         append_depth0_round(stages, u, "none")
@@ -369,13 +370,21 @@ class KernelBuilder:
                     else:
                         append_gather_round(stages, u, depth, "none")
                 elif depth == 0 and top_count >= 1:
-                    append_depth0_round(stages, u, "depth0")
+                    append_depth0_round(
+                        stages, u, "none" if is_last_round else "depth0"
+                    )
                 elif depth == 1 and top_count >= 3 and forest_height >= 1:
-                    append_depth1_round(stages, u, "path")
+                    append_depth1_round(
+                        stages, u, "none" if is_last_round else "path"
+                    )
                 elif depth == 2 and top_count >= 7 and forest_height >= 2:
-                    append_depth2_round(stages, u, "path")
+                    append_depth2_round(
+                        stages, u, "none" if is_last_round else "path"
+                    )
                 else:
-                    append_gather_round(stages, u, depth, "path")
+                    append_gather_round(
+                        stages, u, depth, "none" if is_last_round else "path"
+                    )
             round_sched.add_chain(stages)
         all_round_instrs = round_sched.schedule()
 
