@@ -106,7 +106,7 @@ class KernelConfig:
     hash_reuse_idx: bool = False
     split_node_addr_val: bool = False
     scheduler_pressure_tiebreak: bool = False
-    val_addr_tmps: int = 2
+    val_addr_tmps: int = 4
     val_addr_tmps_load: int = 0
     val_addr_tmps_store: int = 1
     debug_op_tags: bool = False
