@@ -212,8 +212,11 @@ class KernelBuilder:
         # - RAW and WAW as 1-cycle latency constraints
         # - WAR as a 0-cycle constraint
         last_write: dict[int, int] = {}
-        # Last read since the most recent write to that address
-        last_read: dict[int, int] = {}
+        # Reads since the most recent write to that address.
+        # A subsequent write must remain ordered after *all* of these reads
+        # (0-cycle WAR edges), otherwise earlier reads can be incorrectly
+        # moved after the write.
+        pending_reads: dict[int, list[int]] = {}
 
         def vec_addrs(base: int):
             return list(range(base, base + V))
@@ -239,8 +242,7 @@ class KernelBuilder:
                 if lw is not None:
                     if dep_lat.get(lw, -1) < 1:
                         dep_lat[lw] = 1
-                lr = last_read.get(addr)
-                if lr is not None:
+                for lr in pending_reads.get(addr, ()):
                     # Only add the WAR edge if it isn't already a 1-cycle dep
                     if dep_lat.get(lr, -1) < 0:
                         dep_lat[lr] = 0
@@ -263,12 +265,16 @@ class KernelBuilder:
 
             # Update hazard trackers
             for addr in reads:
-                last_read[addr] = op_id
+                readers = pending_reads.get(addr)
+                if readers is None:
+                    pending_reads[addr] = [op_id]
+                elif not readers or readers[-1] != op_id:
+                    readers.append(op_id)
             for addr in writes:
                 last_write[addr] = op_id
                 # Reads before this write no longer constrain future writes
-                if addr in last_read:
-                    del last_read[addr]
+                if addr in pending_reads:
+                    del pending_reads[addr]
 
             return op_id
 
@@ -3206,8 +3212,35 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
+    has_pause = any(
+        slot[0] == "pause" for instr in kb.instrs for slot in instr.get("flow", [])
+    )
+
+    if has_pause:
+        # Legacy mode: kernel yields once per round via flow.pause.
+        for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
+            machine.run()
+            inp_values_p = ref_mem[6]
+            if prints:
+                print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+                print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+            assert (
+                machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+                == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+            ), f"Incorrect result on round {i}"
+            inp_indices_p = ref_mem[5]
+            if prints:
+                print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+                print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+            # Updating these in memory isn't required, but you can enable this check for debugging
+            # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+    else:
+        # DAG-scheduled mode: kernel computes all rounds in one run.
+        for ref_mem in reference_kernel2(mem, value_trace):
+            pass
+        machine.enable_pause = False
         machine.run()
+
         inp_values_p = ref_mem[6]
         if prints:
             print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
@@ -3215,13 +3248,7 @@ def do_kernel_test(
         assert (
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+        ), "Incorrect output values"
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
