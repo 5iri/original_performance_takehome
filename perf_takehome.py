@@ -96,7 +96,7 @@ class KernelConfig:
     preload_r_mod4: bool = False
     r_mod4_valu_select: bool = False
     node_addr_valu: bool = False
-    idx_reset_on_r0: bool = False
+    idx_reset_on_r0: bool = True
     chunk_block: int = 0
     probe_alu_ops: int = 0
     hash_ping_pong: bool = True
